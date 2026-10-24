@@ -1,170 +1,224 @@
-import crypto from 'node:crypto';
+﻿/**
+ * _telemetry.js - NexusMind Telemetry Sender (Vercel Serverless Helper)
+ *
+ * Sends structured observability events to the NexusMind drain receiver at
+ * POST /api/observability/drain/{connectionId}.
+ *
+ * SECURITY RULES enforced here:
+ *  - VERCEL_DRAIN_SECRET is read once, trimmed (no print/log), used only for signing.
+ *  - NEXUSMIND_CONNECTION_ID is read once, trimmed.
+ *  - Each send() call (initial + every retry) generates a FRESH timestamp and HMAC
+ *    signature over `{timestamp}:{serialized_body}`.  The serialized body bytes are
+ *    identical across retries so receiver-side idempotency (event id deduplication)
+ *    prevents duplicate ingestion when the original response was lost.
+ *  - On HTTP rejection, ONLY the bounded HTTP status code and the receiver's JSON
+ *    `detail` string (<=256 chars) are logged.  Credentials, auth headers, and
+ *    event payload bodies are never logged.
+ *  - Partial signatures are never logged.
+ *
+ * IDEMPOTENCY CONTRACT:
+ *  - Every event carries a stable `id` field (caller-supplied or deterministic
+ *    fingerprint computed here from timestamp + path + message).
+ *  - The NexusMind receiver deduplicates by event id inside ObservabilityLogStore.
+ *  - Replay protection uses per-request signatures (fresh ts+sig each attempt),
+ *    so retries are never blocked by replay detection while still being
+ *    deduplicated on the receiver side.
+ */
 
-const MAX_MESSAGE_LENGTH = 512;
-const MAX_STACK_LENGTH = 1536;
-const DEFAULT_TIMEOUT_MS = 2500;
-const MAX_RETRIES = 2; // Total 3 attempts (initial + 2 retries)
-const INITIAL_BACKOFF_MS = 150;
+import { createHmac } from 'crypto';
+
+// ---------------------------------------------------------------------------
+// Configuration - resolved once, trimmed, never logged or re-printed.
+// ---------------------------------------------------------------------------
 
 /**
- * Redact obvious credentials, tokens, and secrets from text.
+ * Resolve and trim an environment variable without logging its value.
+ * Returns null if the variable is absent or blank after trimming.
+ * @param {string} name
+ * @returns {string|null}
  */
-export function sanitizeText(text) {
-  if (!text || typeof text !== 'string') return '';
-  return text
-    // Redact GitHub personal access tokens
-    .replace(/gh[pousr]_[A-Za-z0-9_]{16,255}/g, 'ghp_***REDACTED***')
-    // Redact Vercel tokens
-    .replace(/vcp_[A-Za-z0-9_]{16,255}/g, 'vcp_***REDACTED***')
-    // Redact Bearer tokens
-    .replace(/(Bearer\s+)[A-Za-z0-9_\-\.]{12,}/gi, '$1***REDACTED***')
-    // Redact password, secret, token, api_key assignments
-    .replace(
-      /(?:password|secret|token|api[_-]?key|auth(?:orization)?)\s*[:=]\s*['"]?[A-Za-z0-9_\-\.]{8,}['"]?/gi,
-      '***REDACTED***'
-    )
-    // Redact OpenAI style keys
-    .replace(/\bsk-[A-Za-z0-9_\-]{20,}\b/g, 'sk-***REDACTED***');
+function _readEnv(name) {
+  const raw = process.env[name];
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+const DRAIN_SECRET = _readEnv('VERCEL_DRAIN_SECRET');
+const CONNECTION_ID = _readEnv('NEXUSMIND_CONNECTION_ID');
+
+// Receiver base URL - defaults to loopback for local dev; override via env.
+const RECEIVER_BASE_URL = _readEnv('NEXUSMIND_RECEIVER_URL') || 'http://127.0.0.1:8000';
+
+/** Maximum send attempts (1 initial + N-1 retries). */
+const MAX_ATTEMPTS = 3;
+
+/** Base delay in ms for exponential back-off between retries. */
+const RETRY_BASE_DELAY_MS = 250;
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute a deterministic, stable event ID from the supplied fields.
+ * The ID is a truncated HMAC-SHA256 hex digest - stable across retries.
+ * @param {number} epochMs
+ * @param {string} path
+ * @param {string} message
+ * @returns {string}
+ */
+function _deterministicId(epochMs, path, message) {
+  const fp = `${epochMs}:${path || ''}:${(message || '').slice(0, 200)}`;
+  return 'drain_' + createHmac('sha256', 'nexusmind_id_v1').update(fp).digest('hex').slice(0, 20);
 }
 
 /**
- * Format and sanitize an application-level runtime exception.
- * Transmits only error metadata and path; never includes request bodies, cookies,
- * authorization headers, or environment variables.
+ * Sign the payload for a single attempt.
+ * Each call uses the current wall-clock time so retries get a fresh
+ * timestamp and a fresh signature, avoiding replay-protection rejection
+ * on the receiver side.
+ *
+ * @param {string} secret      - The drain secret (already trimmed, never logged).
+ * @param {Buffer} bodyBuffer  - The serialized event body (identical across retries).
+ * @returns {{ timestamp: string, signature: string }}
  */
-export function formatTelemetryEvent(error, req = null) {
-  const rawMsg = error?.message || String(error || 'Unknown runtime error');
-  const cleanMsg = sanitizeText(rawMsg).slice(0, MAX_MESSAGE_LENGTH);
+function _signAttempt(secret, bodyBuffer) {
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const sigInput = Buffer.concat([Buffer.from(`${timestamp}:`, 'utf8'), bodyBuffer]);
+  const signature = createHmac('sha256', secret).update(sigInput).digest('hex');
+  return { timestamp, signature };
+}
 
-  let stack = error?.stack ? sanitizeText(error.stack) : '';
-  if (stack.length > MAX_STACK_LENGTH) {
-    stack = stack.slice(0, MAX_STACK_LENGTH) + '\n...[truncated]';
+/**
+ * Sleep for `ms` milliseconds.
+ * @param {number} ms
+ */
+function _sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Send a telemetry event to the NexusMind drain receiver with retry and
+ * receiver-side idempotency.
+ *
+ * - Retries up to MAX_ATTEMPTS times with fresh timestamp+signature per attempt.
+ * - On rejection, logs only the HTTP status and bounded `detail` string from
+ *   the receiver response.  Never logs the secret, auth headers, or event body.
+ * - Returns true on success, false if all attempts fail.
+ *
+ * @param {Object} event
+ * @param {string}  event.message       - Human-readable event description.
+ * @param {string}  [event.id]          - Stable caller-supplied event ID (recommended).
+ * @param {string}  [event.level]       - 'INFO'|'WARNING'|'ERROR'|'FATAL'. Default: 'INFO'.
+ * @param {string}  [event.path]        - HTTP route / function path.
+ * @param {number}  [event.statusCode]  - HTTP status code.
+ * @param {string}  [event.source]      - 'runtime'|'build'|'request'. Default: 'runtime'.
+ * @param {string}  [event.requestId]   - Optional request trace ID.
+ * @param {string}  [event.deploymentId] - Optional Vercel deployment ID.
+ * @param {number}  [event.timestamp]   - Epoch milliseconds. Defaults to Date.now().
+ * @returns {Promise<boolean>}
+ */
+async function sendTelemetry(event) {
+  if (!DRAIN_SECRET) {
+    // Misconfiguration - log category only, never the missing value.
+    console.warn('[NexusMindTelemetry] misconfiguration: VERCEL_DRAIN_SECRET is not set or blank; telemetry disabled.');
+    return false;
+  }
+  if (!CONNECTION_ID) {
+    console.warn('[NexusMindTelemetry] misconfiguration: NEXUSMIND_CONNECTION_ID is not set or blank; telemetry disabled.');
+    return false;
   }
 
-  // Combine message and stack into full message field for ingestion normalizer
-  const fullMessage =
-    stack && !stack.includes(cleanMsg) ? `${cleanMsg}\n${stack}` : stack || cleanMsg;
+  const epochMs = event.timestamp ?? Date.now();
 
-  // Extract path safely, stripping query parameters and potential secrets
-  let routePath = '/api/error';
-  let requestId = null;
-  if (req) {
-    if (req.url) {
-      try {
-        const parsed = new URL(req.url, 'http://localhost');
-        routePath = parsed.pathname;
-      } catch {
-        routePath = typeof req.url === 'string' ? req.url.split('?')[0] : '/api/error';
-      }
-    }
-    requestId = req.headers?.['x-vercel-id'] || req.headers?.['x-request-id'] || null;
-  }
+  // Assign a stable event ID before serialization so it is identical on every retry.
+  const stableId =
+    event.id ||
+    _deterministicId(epochMs, event.path || '', event.message || '');
 
-  const eventId = requestId
-    ? `evt_${requestId}`
-    : `evt_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-
-  return {
-    id: eventId,
-    source: 'runtime',
-    level: 'ERROR',
-    message: fullMessage,
-    statusCode: 500,
-    path: routePath,
-    timestamp: Date.now(),
-    requestId: requestId,
+  const eventPayload = {
+    id: stableId,
+    timestamp: epochMs,
+    source: event.source || 'runtime',
+    level: event.level || 'INFO',
+    message: event.message || '',
+    ...(event.path && { path: event.path }),
+    ...(event.statusCode !== undefined && { statusCode: event.statusCode }),
+    ...(event.requestId && { requestId: event.requestId }),
+    ...(event.deploymentId && { deploymentId: event.deploymentId }),
   };
-}
 
-/**
- * Compute cryptographic HMAC-SHA256 signature over timestamp:rawBody.
- */
-export function computeSignature(timestamp, rawBody, secret) {
-  const contentToSign = `${timestamp}:${rawBody}`;
-  return crypto.createHmac('sha256', secret).update(contentToSign, 'utf8').digest('hex');
-}
+  // Serialize once - body bytes are identical across all retry attempts.
+  // This is required so the stable event ID enables receiver-side deduplication.
+  const bodyBuffer = Buffer.from(JSON.stringify(eventPayload), 'utf8');
+  const drainUrl = `${RECEIVER_BASE_URL}/api/observability/drain/${CONNECTION_ID}`;
 
-/**
- * Send telemetry event to NexusMind ingestion gateway with bounded retries and timeout.
- * Guaranteed never to throw, never to cause secondary errors, and never to expose secrets.
- */
-export async function reportError(error, req = null, options = {}) {
-  try {
-    // Read from server-only environment variables (not exposed to client Vite bundle)
-    const drainUrl = options.drainUrl || process.env.NEXUSMIND_DRAIN_URL;
-    const drainSecret = options.drainSecret || process.env.VERCEL_DRAIN_SECRET;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // Fresh timestamp + fresh signature for every attempt.
+    // Replay protection (per-signature nonce window) never blocks retries.
+    const { timestamp, signature } = _signAttempt(DRAIN_SECRET, bodyBuffer);
 
-    // Gracefully skip if telemetry is not configured
-    if (!drainUrl || !drainSecret) {
+    let response;
+    try {
+      response = await fetch(drainUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          // Only the signature (not the secret) is sent in the header.
+          // The signature value itself is never written to any log.
+          'x-nexusmind-signature': signature,
+          'x-nexusmind-timestamp': timestamp,
+        },
+        body: bodyBuffer,
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch (networkErr) {
+      // Network-level error (timeout, DNS failure) - log category only.
+      console.warn(
+        `[NexusMindTelemetry] attempt=${attempt}/${MAX_ATTEMPTS} network_error=${networkErr.name || 'unknown'} event_id=${stableId}`
+      );
+      if (attempt < MAX_ATTEMPTS) {
+        await _sleep(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1));
+      }
+      continue;
+    }
+
+    if (response.ok) {
+      // Success - do not log anything from the response body.
+      return true;
+    }
+
+    // Parse the bounded rejection reason from the receiver response.
+    // Only the HTTP status and the receiver's own `detail` string are logged.
+    // Never log credentials, auth headers, or the request body/payload.
+    let detail = '';
+    try {
+      const body = await response.json();
+      // `detail` is a short, receiver-generated string (never echoes secrets or bodies).
+      detail = typeof body.detail === 'string' ? body.detail.slice(0, 256) : '';
+    } catch {
+      detail = '(could not parse receiver response)';
+    }
+
+    console.warn(
+      `[NexusMindTelemetry] attempt=${attempt}/${MAX_ATTEMPTS} http_status=${response.status} rejection_detail=${JSON.stringify(detail)} event_id=${stableId}`
+    );
+
+    // 4xx errors (except 429) are non-retryable - the sender cannot fix them by retrying.
+    const isRetryable = response.status === 429 || response.status >= 500;
+    if (!isRetryable || attempt === MAX_ATTEMPTS) {
       return false;
     }
 
-    const event = formatTelemetryEvent(error, req);
-    const rawBody = JSON.stringify(event);
-    const timestamp = Math.floor(Date.now() / 1000).toString();
-    const signature = computeSignature(timestamp, rawBody, drainSecret);
-
-    const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
-    const maxRetries = typeof options.maxRetries === 'number' ? options.maxRetries : MAX_RETRIES;
-    const fetchFn = options.fetchFn || globalThis.fetch;
-
-    let attempt = 0;
-    while (attempt <= maxRetries) {
-      attempt++;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-      try {
-        const response = await fetchFn(drainUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-nexusmind-timestamp': timestamp,
-            'x-nexusmind-signature': signature,
-          },
-          body: rawBody,
-          signal: controller.signal,
-        });
-
-        clearTimeout(timer);
-
-        // Success
-        if (response.status >= 200 && response.status < 300) {
-          return true;
-        }
-
-        // Permanent client error (400, 401, 403, 404, 413) -> do not retry
-        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-          console.warn(
-            `[NexusMind Telemetry] Ingestion rejected with HTTP ${response.status}. Not retrying.`
-          );
-          return false;
-        }
-
-        // Retryable server error (500, 502, 503, 504, 429)
-        if (attempt <= maxRetries) {
-          const backoff = (options.backoffMs || INITIAL_BACKOFF_MS) * Math.pow(2, attempt - 1);
-          await new Promise((res) => setTimeout(res, backoff));
-        }
-      } catch (err) {
-        clearTimeout(timer);
-        // Network failure or timeout
-        if (attempt <= maxRetries) {
-          const backoff = (options.backoffMs || INITIAL_BACKOFF_MS) * Math.pow(2, attempt - 1);
-          await new Promise((res) => setTimeout(res, backoff));
-        } else {
-          console.warn(
-            `[NexusMind Telemetry] Ingestion network delivery failed: ${err.name || 'NetworkError'}`
-          );
-          return false;
-        }
-      }
-    }
-
-    return false;
-  } catch (fatalErr) {
-    // Safety guard: Never throw, never crash host application
-    console.warn(`[NexusMind Telemetry] Internal helper error: ${fatalErr.name || 'Error'}`);
-    return false;
+    await _sleep(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1));
   }
+
+  return false;
 }
+
+export { sendTelemetry };
